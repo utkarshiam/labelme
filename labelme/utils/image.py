@@ -7,19 +7,38 @@ import PIL.Image
 import PIL.ImageOps
 
 
-def img_b64_to_arr(img_b64):
+def img_data_to_pil(img_data):
     f = io.BytesIO()
-    f.write(base64.b64decode(img_b64))
-    img_arr = np.array(PIL.Image.open(f))
+    f.write(img_data)
+    img_pil = PIL.Image.open(f)
+    return img_pil
+
+
+def img_data_to_arr(img_data):
+    img_pil = img_data_to_pil(img_data)
+    img_arr = np.array(img_pil)
     return img_arr
+
+
+def img_b64_to_arr(img_b64):
+    img_data = base64.b64decode(img_b64)
+    img_arr = img_data_to_arr(img_data)
+    return img_arr
+
+
+def img_pil_to_data(img_pil):
+    f = io.BytesIO()
+    img_pil.save(f, format="PNG")
+    img_data = f.getvalue()
+    return img_data
 
 
 def img_arr_to_b64(img_arr):
     img_pil = PIL.Image.fromarray(img_arr)
     f = io.BytesIO()
-    img_pil.save(f, format='PNG')
+    img_pil.save(f, format="PNG")
     img_bin = f.getvalue()
-    if hasattr(base64, 'encodebytes'):
+    if hasattr(base64, "encodebytes"):
         img_b64 = base64.encodebytes(img_bin)
     else:
         img_b64 = base64.encodestring(img_bin)
@@ -32,7 +51,7 @@ def img_data_to_png_data(img_data):
         img = PIL.Image.open(f)
 
         with io.BytesIO() as f:
-            img.save(f, 'PNG')
+            img.save(f, "PNG")
             f.seek(0)
             return f.read()
 
@@ -52,7 +71,7 @@ def apply_exif_orientation(image):
         if k in PIL.ExifTags.TAGS
     }
 
-    orientation = exif.get('Orientation', None)
+    orientation = exif.get("Orientation", None)
 
     if orientation == 1:
         # do nothing

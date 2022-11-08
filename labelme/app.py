@@ -1,9 +1,15 @@
+# -*- coding: utf-8 -*-
+
 import functools
+import html
+import math
 import os
 import os.path as osp
 import re
 import webbrowser
 
+import imgviz
+import natsort
 from qtpy import QtCore
 from qtpy.QtCore import Qt
 from qtpy import QtGui
@@ -11,34 +17,31 @@ from qtpy import QtWidgets
 
 from labelme import __appname__
 from labelme import PY2
-from labelme import QT5
 
 from . import utils
 from labelme.config import get_config
 from labelme.label_file import LabelFile
 from labelme.label_file import LabelFileError
 from labelme.logger import logger
-from labelme.shape import DEFAULT_FILL_COLOR
-from labelme.shape import DEFAULT_LINE_COLOR
 from labelme.shape import Shape
+from labelme.widgets import BrightnessContrastDialog
 from labelme.widgets import Canvas
-from labelme.widgets import ColorDialog
-from labelme.widgets import EscapableQListWidget
+from labelme.widgets import FileDialogPreview
 from labelme.widgets import LabelDialog
-from labelme.widgets import LabelQListWidget
+from labelme.widgets import LabelListWidget
+from labelme.widgets import LabelListWidgetItem
 from labelme.widgets import ToolBar
+from labelme.widgets import UniqueLabelQListWidget
 from labelme.widgets import ZoomWidget
-
 
 # FIXME
 # - [medium] Set max zoom value to something big enough for FitWidth/Window
 
 # TODO(unknown):
-# - [high] Add polygon movement with arrow keys
-# - [high] Deselect shape when clicking and already selected(?)
-# - [low,maybe] Open images with drag & drop.
-# - [low,maybe] Preview images on file dialogs.
 # - Zoom is too "steppy".
+
+
+LABEL_COLORMAP = imgviz.label_colormap()
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -55,7 +58,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ):
         if output is not None:
             logger.warning(
-                'argument output is deprecated, use output_file instead'
+                "argument output is deprecated, use output_file instead"
             )
             if output_file is None:
                 output_file = output
@@ -65,6 +68,25 @@ class MainWindow(QtWidgets.QMainWindow):
             config = get_config()
         self._config = config
 
+        # set default shape colors
+        Shape.line_color = QtGui.QColor(*self._config["shape"]["line_color"])
+        Shape.fill_color = QtGui.QColor(*self._config["shape"]["fill_color"])
+        Shape.select_line_color = QtGui.QColor(
+            *self._config["shape"]["select_line_color"]
+        )
+        Shape.select_fill_color = QtGui.QColor(
+            *self._config["shape"]["select_fill_color"]
+        )
+        Shape.vertex_fill_color = QtGui.QColor(
+            *self._config["shape"]["vertex_fill_color"]
+        )
+        Shape.hvertex_fill_color = QtGui.QColor(
+            *self._config["shape"]["hvertex_fill_color"]
+        )
+
+        # Set point size from config file
+        Shape.point_size = self._config["shape"]["point_size"]
+
         super(MainWindow, self).__init__()
         self.setWindowTitle(__appname__)
 
@@ -73,54 +95,60 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._noSelectionSlot = False
 
+        self._copied_shapes = None
+
         # Main widgets and related state.
         self.labelDialog = LabelDialog(
             parent=self,
-            labels=self._config['labels'],
-            sort_labels=self._config['sort_labels'],
-            show_text_field=self._config['show_label_text_field'],
-            completion=self._config['label_completion'],
-            fit_to_content=self._config['fit_to_content'],
-            flags=self._config['label_flags']
+            labels=self._config["labels"],
+            sort_labels=self._config["sort_labels"],
+            show_text_field=self._config["show_label_text_field"],
+            completion=self._config["label_completion"],
+            fit_to_content=self._config["fit_to_content"],
+            flags=self._config["label_flags"],
         )
 
-        self.labelList = LabelQListWidget()
+        self.labelList = LabelListWidget()
         self.lastOpenDir = None
 
         self.flag_dock = self.flag_widget = None
-        self.flag_dock = QtWidgets.QDockWidget('Flags', self)
-        self.flag_dock.setObjectName('Flags')
+        self.flag_dock = QtWidgets.QDockWidget(self.tr("Flags"), self)
+        self.flag_dock.setObjectName("Flags")
         self.flag_widget = QtWidgets.QListWidget()
-        if config['flags']:
-            self.loadFlags({k: False for k in config['flags']})
+        if config["flags"]:
+            self.loadFlags({k: False for k in config["flags"]})
         self.flag_dock.setWidget(self.flag_widget)
         self.flag_widget.itemChanged.connect(self.setDirty)
 
-        self.labelList.itemActivated.connect(self.labelSelectionChanged)
         self.labelList.itemSelectionChanged.connect(self.labelSelectionChanged)
         self.labelList.itemDoubleClicked.connect(self.editLabel)
-        # Connect to itemChanged to detect checkbox changes.
         self.labelList.itemChanged.connect(self.labelItemChanged)
-        self.labelList.setDragDropMode(
-            QtWidgets.QAbstractItemView.InternalMove)
-        self.labelList.setParent(self)
-        self.shape_dock = QtWidgets.QDockWidget('Polygon Labels', self)
-        self.shape_dock.setObjectName('Labels')
+        self.labelList.itemDropped.connect(self.labelOrderChanged)
+        self.shape_dock = QtWidgets.QDockWidget(
+            self.tr("Polygon Labels"), self
+        )
+        self.shape_dock.setObjectName("Labels")
         self.shape_dock.setWidget(self.labelList)
 
-        self.uniqLabelList = EscapableQListWidget()
+        self.uniqLabelList = UniqueLabelQListWidget()
         self.uniqLabelList.setToolTip(
-            "Select label to start annotating for it. "
-            "Press 'Esc' to deselect.")
-        if self._config['labels']:
-            self.uniqLabelList.addItems(self._config['labels'])
-            self.uniqLabelList.sortItems()
-        self.label_dock = QtWidgets.QDockWidget(u'Label List', self)
-        self.label_dock.setObjectName(u'Label List')
+            self.tr(
+                "Select label to start annotating for it. "
+                "Press 'Esc' to deselect."
+            )
+        )
+        if self._config["labels"]:
+            for label in self._config["labels"]:
+                item = self.uniqLabelList.createItemFromLabel(label)
+                self.uniqLabelList.addItem(item)
+                rgb = self._get_rgb_by_label(label)
+                self.uniqLabelList.setItemLabel(item, label, rgb)
+        self.label_dock = QtWidgets.QDockWidget(self.tr("Label List"), self)
+        self.label_dock.setObjectName("Label List")
         self.label_dock.setWidget(self.uniqLabelList)
 
         self.fileSearch = QtWidgets.QLineEdit()
-        self.fileSearch.setPlaceholderText('Search Filename')
+        self.fileSearch.setPlaceholderText(self.tr("Search Filename"))
         self.fileSearch.textChanged.connect(self.fileSearchChanged)
         self.fileListWidget = QtWidgets.QListWidget()
         self.fileListWidget.itemSelectionChanged.connect(
@@ -131,17 +159,19 @@ class MainWindow(QtWidgets.QMainWindow):
         fileListLayout.setSpacing(0)
         fileListLayout.addWidget(self.fileSearch)
         fileListLayout.addWidget(self.fileListWidget)
-        self.file_dock = QtWidgets.QDockWidget(u'File List', self)
-        self.file_dock.setObjectName(u'Files')
+        self.file_dock = QtWidgets.QDockWidget(self.tr("File List"), self)
+        self.file_dock.setObjectName("Files")
         fileListWidget = QtWidgets.QWidget()
         fileListWidget.setLayout(fileListLayout)
         self.file_dock.setWidget(fileListWidget)
 
         self.zoomWidget = ZoomWidget()
-        self.colorDialog = ColorDialog(parent=self)
+        self.setAcceptDrops(True)
 
         self.canvas = self.labelList.canvas = Canvas(
-            epsilon=self._config['epsilon'],
+            epsilon=self._config["epsilon"],
+            double_click=self._config["canvas"]["double_click"],
+            num_backups=self._config["canvas"]["num_backups"],
         )
         self.canvas.zoomRequest.connect(self.zoomRequest)
 
@@ -162,15 +192,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(scrollArea)
 
         features = QtWidgets.QDockWidget.DockWidgetFeatures()
-        for dock in ['flag_dock', 'label_dock', 'shape_dock', 'file_dock']:
-            if self._config[dock]['closable']:
+        for dock in ["flag_dock", "label_dock", "shape_dock", "file_dock"]:
+            if self._config[dock]["closable"]:
                 features = features | QtWidgets.QDockWidget.DockWidgetClosable
-            if self._config[dock]['floatable']:
+            if self._config[dock]["floatable"]:
                 features = features | QtWidgets.QDockWidget.DockWidgetFloatable
-            if self._config[dock]['movable']:
+            if self._config[dock]["movable"]:
                 features = features | QtWidgets.QDockWidget.DockWidgetMovable
             getattr(self, dock).setFeatures(features)
-            if self._config[dock]['show'] is False:
+            if self._config[dock]["show"] is False:
                 getattr(self, dock).setVisible(False)
 
         self.addDockWidget(Qt.RightDockWidgetArea, self.flag_dock)
@@ -180,199 +210,335 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Actions
         action = functools.partial(utils.newAction, self)
-        shortcuts = self._config['shortcuts']
-        quit = action('&Quit', self.close, shortcuts['quit'], 'quit',
-                      'Quit application')
-        open_ = action('&Open', self.openFile, shortcuts['open'], 'open',
-                       'Open image or label file')
-        opendir = action('&Open Dir', self.openDirDialog,
-                         shortcuts['open_dir'], 'open', u'Open Dir')
+        shortcuts = self._config["shortcuts"]
+        quit = action(
+            self.tr("&Quit"),
+            self.close,
+            shortcuts["quit"],
+            "quit",
+            self.tr("Quit application"),
+        )
+        open_ = action(
+            self.tr("&Open"),
+            self.openFile,
+            shortcuts["open"],
+            "open",
+            self.tr("Open image or label file"),
+        )
+        opendir = action(
+            self.tr("&Open Dir"),
+            self.openDirDialog,
+            shortcuts["open_dir"],
+            "open",
+            self.tr("Open Dir"),
+        )
         openNextImg = action(
-            '&Next Image',
+            self.tr("&Next Image"),
             self.openNextImg,
-            shortcuts['open_next'],
-            'next',
-            u'Open next (hold Ctl+Shift to copy labels)',
+            shortcuts["open_next"],
+            "next",
+            self.tr("Open next (hold Ctl+Shift to copy labels)"),
             enabled=False,
         )
         openPrevImg = action(
-            '&Prev Image',
+            self.tr("&Prev Image"),
             self.openPrevImg,
-            shortcuts['open_prev'],
-            'prev',
-            u'Open prev (hold Ctl+Shift to copy labels)',
+            shortcuts["open_prev"],
+            "prev",
+            self.tr("Open prev (hold Ctl+Shift to copy labels)"),
             enabled=False,
         )
-        save = action('&Save', self.saveFile, shortcuts['save'], 'save',
-                      'Save labels to file', enabled=False)
-        saveAs = action('&Save As', self.saveFileAs, shortcuts['save_as'],
-                        'save-as', 'Save labels to a different file',
-                        enabled=False)
+        save = action(
+            self.tr("&Save"),
+            self.saveFile,
+            shortcuts["save"],
+            "save",
+            self.tr("Save labels to file"),
+            enabled=False,
+        )
+        saveAs = action(
+            self.tr("&Save As"),
+            self.saveFileAs,
+            shortcuts["save_as"],
+            "save-as",
+            self.tr("Save labels to a different file"),
+            enabled=False,
+        )
 
         deleteFile = action(
-            '&Delete File',
+            self.tr("&Delete File"),
             self.deleteFile,
-            shortcuts['delete_file'],
-            'delete',
-            'Delete current label file',
-            enabled=False)
+            shortcuts["delete_file"],
+            "delete",
+            self.tr("Delete current label file"),
+            enabled=False,
+        )
 
         changeOutputDir = action(
-            '&Change Output Dir',
+            self.tr("&Change Output Dir"),
             slot=self.changeOutputDirDialog,
-            shortcut=shortcuts['save_to'],
-            icon='open',
-            tip=u'Change where annotations are loaded/saved'
+            shortcut=shortcuts["save_to"],
+            icon="open",
+            tip=self.tr("Change where annotations are loaded/saved"),
         )
 
         saveAuto = action(
-            text='Save &Automatically',
+            text=self.tr("Save &Automatically"),
             slot=lambda x: self.actions.saveAuto.setChecked(x),
-            icon='save',
-            tip='Save automatically',
+            icon="save",
+            tip=self.tr("Save automatically"),
             checkable=True,
             enabled=True,
         )
-        saveAuto.setChecked(self._config['auto_save'])
+        saveAuto.setChecked(self._config["auto_save"])
 
-        close = action('&Close', self.closeFile, shortcuts['close'], 'close',
-                       'Close current file')
-        color1 = action('Polygon &Line Color', self.chooseColor1,
-                        shortcuts['edit_line_color'], 'color_line',
-                        'Choose polygon line color')
-        color2 = action('Polygon &Fill Color', self.chooseColor2,
-                        shortcuts['edit_fill_color'], 'color',
-                        'Choose polygon fill color')
+        saveWithImageData = action(
+            text="Save With Image Data",
+            slot=self.enableSaveImageWithData,
+            tip="Save image data in label file",
+            checkable=True,
+            checked=self._config["store_data"],
+        )
+
+        close = action(
+            "&Close",
+            self.closeFile,
+            shortcuts["close"],
+            "close",
+            "Close current file",
+        )
 
         toggle_keep_prev_mode = action(
-            'Keep Previous Annotation',
+            self.tr("Keep Previous Annotation"),
             self.toggleKeepPrevMode,
-            shortcuts['toggle_keep_prev_mode'], None,
-            'Toggle "keep pevious annotation" mode',
-            checkable=True)
-        toggle_keep_prev_mode.setChecked(self._config['keep_prev'])
+            shortcuts["toggle_keep_prev_mode"],
+            None,
+            self.tr('Toggle "keep pevious annotation" mode'),
+            checkable=True,
+        )
+        toggle_keep_prev_mode.setChecked(self._config["keep_prev"])
 
         createMode = action(
-            'Create Polygons',
-            lambda: self.toggleDrawMode(False, createMode='polygon'),
-            shortcuts['create_polygon'],
-            'objects',
-            'Start drawing polygons',
+            self.tr("Create Polygons"),
+            lambda: self.toggleDrawMode(False, createMode="polygon"),
+            shortcuts["create_polygon"],
+            "objects",
+            self.tr("Start drawing polygons"),
             enabled=False,
         )
         createRectangleMode = action(
-            'Create Rectangle',
-            lambda: self.toggleDrawMode(False, createMode='rectangle'),
-            shortcuts['create_rectangle'],
-            'objects',
-            'Start drawing rectangles',
+            self.tr("Create Rectangle"),
+            lambda: self.toggleDrawMode(False, createMode="rectangle"),
+            shortcuts["create_rectangle"],
+            "objects",
+            self.tr("Start drawing rectangles"),
             enabled=False,
         )
         createCircleMode = action(
-            'Create Circle',
-            lambda: self.toggleDrawMode(False, createMode='circle'),
-            shortcuts['create_circle'],
-            'objects',
-            'Start drawing circles',
+            self.tr("Create Circle"),
+            lambda: self.toggleDrawMode(False, createMode="circle"),
+            shortcuts["create_circle"],
+            "objects",
+            self.tr("Start drawing circles"),
             enabled=False,
         )
         createLineMode = action(
-            'Create Line',
-            lambda: self.toggleDrawMode(False, createMode='line'),
-            shortcuts['create_line'],
-            'objects',
-            'Start drawing lines',
+            self.tr("Create Line"),
+            lambda: self.toggleDrawMode(False, createMode="line"),
+            shortcuts["create_line"],
+            "objects",
+            self.tr("Start drawing lines"),
             enabled=False,
         )
         createPointMode = action(
-            'Create Point',
-            lambda: self.toggleDrawMode(False, createMode='point'),
-            shortcuts['create_point'],
-            'objects',
-            'Start drawing points',
+            self.tr("Create Point"),
+            lambda: self.toggleDrawMode(False, createMode="point"),
+            shortcuts["create_point"],
+            "objects",
+            self.tr("Start drawing points"),
             enabled=False,
         )
         createLineStripMode = action(
-            'Create LineStrip',
-            lambda: self.toggleDrawMode(False, createMode='linestrip'),
-            shortcuts['create_linestrip'],
-            'objects',
-            'Start drawing linestrip. Ctrl+LeftClick ends creation.',
+            self.tr("Create LineStrip"),
+            lambda: self.toggleDrawMode(False, createMode="linestrip"),
+            shortcuts["create_linestrip"],
+            "objects",
+            self.tr("Start drawing linestrip. Ctrl+LeftClick ends creation."),
             enabled=False,
         )
-        editMode = action('Edit Polygons', self.setEditMode,
-                          shortcuts['edit_polygon'], 'edit',
-                          'Move and edit the selected polygons', enabled=False)
-
-        delete = action('Delete Polygons', self.deleteSelectedShape,
-                        shortcuts['delete_polygon'], 'cancel',
-                        'Delete the selected polygons', enabled=False)
-        copy = action('Duplicate Polygons', self.copySelectedShape,
-                      shortcuts['duplicate_polygon'], 'copy',
-                      'Create a duplicate of the selected polygons',
-                      enabled=False)
-        undoLastPoint = action('Undo last point', self.canvas.undoLastPoint,
-                               shortcuts['undo_last_point'], 'undo',
-                               'Undo last drawn point', enabled=False)
-        addPointToEdge = action(
-            'Add Point to Edge',
-            self.canvas.addPointToEdge,
-            shortcuts['add_point_to_edge'],
-            'edit',
-            'Add point to the nearest edge',
+        editMode = action(
+            self.tr("Edit Polygons"),
+            self.setEditMode,
+            shortcuts["edit_polygon"],
+            "edit",
+            self.tr("Move and edit the selected polygons"),
             enabled=False,
         )
 
-        undo = action('Undo', self.undoShapeEdit, shortcuts['undo'], 'undo',
-                      'Undo last add and edit of shape', enabled=False)
+        delete = action(
+            self.tr("Delete Polygons"),
+            self.deleteSelectedShape,
+            shortcuts["delete_polygon"],
+            "cancel",
+            self.tr("Delete the selected polygons"),
+            enabled=False,
+        )
+        duplicate = action(
+            self.tr("Duplicate Polygons"),
+            self.duplicateSelectedShape,
+            shortcuts["duplicate_polygon"],
+            "copy",
+            self.tr("Create a duplicate of the selected polygons"),
+            enabled=False,
+        )
+        copy = action(
+            self.tr("Copy Polygons"),
+            self.copySelectedShape,
+            shortcuts["copy_polygon"],
+            "copy_clipboard",
+            self.tr("Copy selected polygons to clipboard"),
+            enabled=False,
+        )
+        paste = action(
+            self.tr("Paste Polygons"),
+            self.pasteSelectedShape,
+            shortcuts["paste_polygon"],
+            "paste",
+            self.tr("Paste copied polygons"),
+            enabled=False,
+        )
+        undoLastPoint = action(
+            self.tr("Undo last point"),
+            self.canvas.undoLastPoint,
+            shortcuts["undo_last_point"],
+            "undo",
+            self.tr("Undo last drawn point"),
+            enabled=False,
+        )
+        removePoint = action(
+            text="Remove Selected Point",
+            slot=self.removeSelectedPoint,
+            shortcut=shortcuts["remove_selected_point"],
+            icon="edit",
+            tip="Remove selected point from polygon",
+            enabled=False,
+        )
 
-        hideAll = action('&Hide\nPolygons',
-                         functools.partial(self.togglePolygons, False),
-                         icon='eye', tip='Hide all polygons', enabled=False)
-        showAll = action('&Show\nPolygons',
-                         functools.partial(self.togglePolygons, True),
-                         icon='eye', tip='Show all polygons', enabled=False)
+        undo = action(
+            self.tr("Undo"),
+            self.undoShapeEdit,
+            shortcuts["undo"],
+            "undo",
+            self.tr("Undo last add and edit of shape"),
+            enabled=False,
+        )
 
-        help = action('&Tutorial', self.tutorial, icon='help',
-                      tip='Show tutorial page')
+        hideAll = action(
+            self.tr("&Hide\nPolygons"),
+            functools.partial(self.togglePolygons, False),
+            icon="eye",
+            tip=self.tr("Hide all polygons"),
+            enabled=False,
+        )
+        showAll = action(
+            self.tr("&Show\nPolygons"),
+            functools.partial(self.togglePolygons, True),
+            icon="eye",
+            tip=self.tr("Show all polygons"),
+            enabled=False,
+        )
+
+        help = action(
+            self.tr("&Tutorial"),
+            self.tutorial,
+            icon="help",
+            tip=self.tr("Show tutorial page"),
+        )
 
         zoom = QtWidgets.QWidgetAction(self)
         zoom.setDefaultWidget(self.zoomWidget)
         self.zoomWidget.setWhatsThis(
-            'Zoom in or out of the image. Also accessible with '
-            '{} and {} from the canvas.'
-            .format(
+            str(
+                self.tr(
+                    "Zoom in or out of the image. Also accessible with "
+                    "{} and {} from the canvas."
+                )
+            ).format(
                 utils.fmtShortcut(
-                    '{},{}'.format(
-                        shortcuts['zoom_in'], shortcuts['zoom_out']
-                    )
+                    "{},{}".format(shortcuts["zoom_in"], shortcuts["zoom_out"])
                 ),
-                utils.fmtShortcut("Ctrl+Wheel"),
+                utils.fmtShortcut(self.tr("Ctrl+Wheel")),
             )
         )
         self.zoomWidget.setEnabled(False)
 
-        zoomIn = action('Zoom &In', functools.partial(self.addZoom, 1.1),
-                        shortcuts['zoom_in'], 'zoom-in',
-                        'Increase zoom level', enabled=False)
-        zoomOut = action('&Zoom Out', functools.partial(self.addZoom, 0.9),
-                         shortcuts['zoom_out'], 'zoom-out',
-                         'Decrease zoom level', enabled=False)
-        zoomOrg = action('&Original size',
-                         functools.partial(self.setZoom, 100),
-                         shortcuts['zoom_to_original'], 'zoom',
-                         'Zoom to original size', enabled=False)
-        fitWindow = action('&Fit Window', self.setFitWindow,
-                           shortcuts['fit_window'], 'fit-window',
-                           'Zoom follows window size', checkable=True,
-                           enabled=False)
-        fitWidth = action('Fit &Width', self.setFitWidth,
-                          shortcuts['fit_width'], 'fit-width',
-                          'Zoom follows window width',
-                          checkable=True, enabled=False)
+        zoomIn = action(
+            self.tr("Zoom &In"),
+            functools.partial(self.addZoom, 1.1),
+            shortcuts["zoom_in"],
+            "zoom-in",
+            self.tr("Increase zoom level"),
+            enabled=False,
+        )
+        zoomOut = action(
+            self.tr("&Zoom Out"),
+            functools.partial(self.addZoom, 0.9),
+            shortcuts["zoom_out"],
+            "zoom-out",
+            self.tr("Decrease zoom level"),
+            enabled=False,
+        )
+        zoomOrg = action(
+            self.tr("&Original size"),
+            functools.partial(self.setZoom, 100),
+            shortcuts["zoom_to_original"],
+            "zoom",
+            self.tr("Zoom to original size"),
+            enabled=False,
+        )
+        keepPrevScale = action(
+            self.tr("&Keep Previous Scale"),
+            self.enableKeepPrevScale,
+            tip=self.tr("Keep previous zoom scale"),
+            checkable=True,
+            checked=self._config["keep_prev_scale"],
+            enabled=True,
+        )
+        fitWindow = action(
+            self.tr("&Fit Window"),
+            self.setFitWindow,
+            shortcuts["fit_window"],
+            "fit-window",
+            self.tr("Zoom follows window size"),
+            checkable=True,
+            enabled=False,
+        )
+        fitWidth = action(
+            self.tr("Fit &Width"),
+            self.setFitWidth,
+            shortcuts["fit_width"],
+            "fit-width",
+            self.tr("Zoom follows window width"),
+            checkable=True,
+            enabled=False,
+        )
+        brightnessContrast = action(
+            "&Brightness Contrast",
+            self.brightnessContrast,
+            None,
+            "color",
+            "Adjust brightness and contrast",
+            enabled=False,
+        )
         # Group zoom controls into a list for easier toggling.
-        zoomActions = (self.zoomWidget, zoomIn, zoomOut, zoomOrg,
-                       fitWindow, fitWidth)
+        zoomActions = (
+            self.zoomWidget,
+            zoomIn,
+            zoomOut,
+            zoomOrg,
+            fitWindow,
+            fitWidth,
+        )
         self.zoomMode = self.FIT_WINDOW
         fitWindow.setChecked(Qt.Checked)
         self.scalers = {
@@ -382,71 +548,83 @@ class MainWindow(QtWidgets.QMainWindow):
             self.MANUAL_ZOOM: lambda: 1,
         }
 
-        edit = action('&Edit Label', self.editLabel, shortcuts['edit_label'],
-                      'edit', 'Modify the label of the selected polygon',
-                      enabled=False)
+        edit = action(
+            self.tr("&Edit Label"),
+            self.editLabel,
+            shortcuts["edit_label"],
+            "edit",
+            self.tr("Modify the label of the selected polygon"),
+            enabled=False,
+        )
 
-        shapeLineColor = action(
-            'Shape &Line Color', self.chshapeLineColor, icon='color-line',
-            tip='Change the line color for this specific shape', enabled=False)
-        shapeFillColor = action(
-            'Shape &Fill Color', self.chshapeFillColor, icon='color',
-            tip='Change the fill color for this specific shape', enabled=False)
         fill_drawing = action(
-            'Fill Drawing Polygon',
-            lambda x: self.canvas.setFillDrawing(x),
+            self.tr("Fill Drawing Polygon"),
+            self.canvas.setFillDrawing,
             None,
-            'color',
-            'Fill polygon while drawing',
+            "color",
+            self.tr("Fill polygon while drawing"),
             checkable=True,
             enabled=True,
         )
-        fill_drawing.setChecked(True)
+        fill_drawing.trigger()
 
         # Lavel list context menu.
         labelMenu = QtWidgets.QMenu()
         utils.addActions(labelMenu, (edit, delete))
         self.labelList.setContextMenuPolicy(Qt.CustomContextMenu)
         self.labelList.customContextMenuRequested.connect(
-            self.popLabelListMenu)
+            self.popLabelListMenu
+        )
 
         # Store actions for further handling.
         self.actions = utils.struct(
             saveAuto=saveAuto,
+            saveWithImageData=saveWithImageData,
             changeOutputDir=changeOutputDir,
-            save=save, saveAs=saveAs, open=open_, close=close,
+            save=save,
+            saveAs=saveAs,
+            open=open_,
+            close=close,
             deleteFile=deleteFile,
-            lineColor=color1, fillColor=color2,
             toggleKeepPrevMode=toggle_keep_prev_mode,
-            delete=delete, edit=edit, copy=copy,
-            undoLastPoint=undoLastPoint, undo=undo,
-            addPointToEdge=addPointToEdge,
-            createMode=createMode, editMode=editMode,
+            delete=delete,
+            edit=edit,
+            duplicate=duplicate,
+            copy=copy,
+            paste=paste,
+            undoLastPoint=undoLastPoint,
+            undo=undo,
+            removePoint=removePoint,
+            createMode=createMode,
+            editMode=editMode,
             createRectangleMode=createRectangleMode,
             createCircleMode=createCircleMode,
             createLineMode=createLineMode,
             createPointMode=createPointMode,
             createLineStripMode=createLineStripMode,
-            shapeLineColor=shapeLineColor, shapeFillColor=shapeFillColor,
-            zoom=zoom, zoomIn=zoomIn, zoomOut=zoomOut, zoomOrg=zoomOrg,
-            fitWindow=fitWindow, fitWidth=fitWidth,
+            zoom=zoom,
+            zoomIn=zoomIn,
+            zoomOut=zoomOut,
+            zoomOrg=zoomOrg,
+            keepPrevScale=keepPrevScale,
+            fitWindow=fitWindow,
+            fitWidth=fitWidth,
+            brightnessContrast=brightnessContrast,
             zoomActions=zoomActions,
-            openNextImg=openNextImg, openPrevImg=openPrevImg,
+            openNextImg=openNextImg,
+            openPrevImg=openPrevImg,
             fileMenuActions=(open_, opendir, save, saveAs, close, quit),
             tool=(),
             # XXX: need to add some actions here to activate the shortcut
             editMenu=(
                 edit,
-                copy,
+                duplicate,
                 delete,
                 None,
                 undo,
                 undoLastPoint,
                 None,
-                addPointToEdge,
-                None,
-                color1,
-                color2,
+                removePoint,
                 None,
                 toggle_keep_prev_mode,
             ),
@@ -460,13 +638,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 createLineStripMode,
                 editMode,
                 edit,
+                duplicate,
                 copy,
+                paste,
                 delete,
-                shapeLineColor,
-                shapeFillColor,
                 undo,
                 undoLastPoint,
-                addPointToEdge,
+                removePoint,
             ),
             onLoadActive=(
                 close,
@@ -477,20 +655,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 createPointMode,
                 createLineStripMode,
                 editMode,
+                brightnessContrast,
             ),
             onShapesPresent=(saveAs, hideAll, showAll),
         )
 
-        self.canvas.edgeSelected.connect(
-            self.actions.addPointToEdge.setEnabled
-        )
+        self.canvas.vertexSelected.connect(self.actions.removePoint.setEnabled)
 
         self.menus = utils.struct(
-            file=self.menu('&File'),
-            edit=self.menu('&Edit'),
-            view=self.menu('&View'),
-            help=self.menu('&Help'),
-            recentFiles=QtWidgets.QMenu('Open &Recent'),
+            file=self.menu(self.tr("&File")),
+            edit=self.menu(self.tr("&Edit")),
+            view=self.menu(self.tr("&View")),
+            help=self.menu(self.tr("&Help")),
+            recentFiles=QtWidgets.QMenu(self.tr("Open &Recent")),
             labelList=labelMenu,
         )
 
@@ -506,6 +683,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 saveAs,
                 saveAuto,
                 changeOutputDir,
+                saveWithImageData,
                 close,
                 deleteFile,
                 None,
@@ -529,10 +707,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 zoomIn,
                 zoomOut,
                 zoomOrg,
+                keepPrevScale,
                 None,
                 fitWindow,
                 fitWidth,
                 None,
+                brightnessContrast,
             ),
         )
 
@@ -543,12 +723,12 @@ class MainWindow(QtWidgets.QMainWindow):
         utils.addActions(
             self.canvas.menus[1],
             (
-                action('&Copy here', self.copyShape),
-                action('&Move here', self.moveShape),
+                action("&Copy here", self.copyShape),
+                action("&Move here", self.moveShape),
             ),
         )
 
-        self.tools = self.toolbar('Tools')
+        self.tools = self.toolbar("Tools")
         # Menu buttons on Left
         self.actions.tool = (
             open_,
@@ -560,25 +740,25 @@ class MainWindow(QtWidgets.QMainWindow):
             None,
             createMode,
             editMode,
+            duplicate,
             copy,
+            paste,
             delete,
             undo,
+            brightnessContrast,
             None,
-            zoomIn,
             zoom,
-            zoomOut,
-            fitWindow,
             fitWidth,
         )
 
-        self.statusBar().showMessage('%s started.' % __appname__)
+        self.statusBar().showMessage(str(self.tr("%s started.")) % __appname__)
         self.statusBar().show()
 
-        if output_file is not None and self._config['auto_save']:
+        if output_file is not None and self._config["auto_save"]:
             logger.warn(
-                'If `auto_save` argument is True, `output_file` argument '
-                'is ignored and output filename is automatically '
-                'set as IMAGE_BASENAME.json.'
+                "If `auto_save` argument is True, `output_file` argument "
+                "is ignored and output filename is automatically "
+                "set as IMAGE_BASENAME.json."
             )
         self.output_file = output_file
         self.output_dir = output_dir
@@ -588,40 +768,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.imagePath = None
         self.recentFiles = []
         self.maxRecent = 7
-        self.lineColor = None
-        self.fillColor = None
         self.otherData = None
         self.zoom_level = 100
         self.fit_window = False
+        self.zoom_values = {}  # key=filename, value=(zoom_mode, zoom_value)
+        self.brightnessContrast_values = {}
+        self.scroll_values = {
+            Qt.Horizontal: {},
+            Qt.Vertical: {},
+        }  # key=filename, value=scroll_value
 
         if filename is not None and osp.isdir(filename):
             self.importDirImages(filename, load=False)
         else:
             self.filename = filename
 
-        if config['file_search']:
-            self.fileSearch.setText(config['file_search'])
+        if config["file_search"]:
+            self.fileSearch.setText(config["file_search"])
             self.fileSearchChanged()
 
         # XXX: Could be completely declarative.
         # Restore application settings.
-        self.settings = QtCore.QSettings('labelme', 'labelme')
-        # FIXME: QSettings.value can return None on PyQt4
-        self.recentFiles = self.settings.value('recentFiles', []) or []
-        size = self.settings.value('window/size', QtCore.QSize(600, 500))
-        position = self.settings.value('window/position', QtCore.QPoint(0, 0))
+        self.settings = QtCore.QSettings("labelme", "labelme")
+        self.recentFiles = self.settings.value("recentFiles", []) or []
+        size = self.settings.value("window/size", QtCore.QSize(600, 500))
+        position = self.settings.value("window/position", QtCore.QPoint(0, 0))
+        state = self.settings.value("window/state", QtCore.QByteArray())
         self.resize(size)
         self.move(position)
         # or simply:
         # self.restoreGeometry(settings['window/geometry']
-        self.restoreState(
-            self.settings.value('window/state', QtCore.QByteArray()))
-        self.lineColor = QtGui.QColor(
-            self.settings.value('line/color', Shape.line_color))
-        self.fillColor = QtGui.QColor(
-            self.settings.value('fill/color', Shape.fill_color))
-        Shape.line_color = self.lineColor
-        Shape.fill_color = self.fillColor
+        self.restoreState(state)
 
         # Populate the File menu dynamically.
         self.updateFileMenu()
@@ -647,7 +824,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def toolbar(self, title, actions=None):
         toolbar = ToolBar(title)
-        toolbar.setObjectName('%sToolBar' % title)
+        toolbar.setObjectName("%sToolBar" % title)
         # toolbar.setOrientation(Qt.Vertical)
         toolbar.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         if actions:
@@ -658,7 +835,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # Support Functions
 
     def noShapes(self):
-        return not self.labelList.itemsToShapes
+        return not len(self.labelList)
 
     def populateModeActions(self):
         tool, menu = self.actions.tool, self.actions.menu
@@ -679,8 +856,11 @@ class MainWindow(QtWidgets.QMainWindow):
         utils.addActions(self.menus.edit, actions + self.actions.editMenu)
 
     def setDirty(self):
-        if self._config['auto_save'] or self.actions.saveAuto.isChecked():
-            label_file = osp.splitext(self.imagePath)[0] + '.json'
+        # Even if we autosave the file, we keep the ability to undo
+        self.actions.undo.setEnabled(self.canvas.isShapeRestorable)
+
+        if self._config["auto_save"] or self.actions.saveAuto.isChecked():
+            label_file = osp.splitext(self.imagePath)[0] + ".json"
             if self.output_dir:
                 label_file_without_path = osp.basename(label_file)
                 label_file = osp.join(self.output_dir, label_file_without_path)
@@ -688,10 +868,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.dirty = True
         self.actions.save.setEnabled(True)
-        self.actions.undo.setEnabled(self.canvas.isShapeRestorable)
         title = __appname__
         if self.filename is not None:
-            title = '{} - {}*'.format(title, self.filename)
+            title = "{} - {}*".format(title, self.filename)
         self.setWindowTitle(title)
 
     def setClean(self):
@@ -705,7 +884,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.createLineStripMode.setEnabled(True)
         title = __appname__
         if self.filename is not None:
-            title = '{} - {}'.format(title, self.filename)
+            title = "{} - {}".format(title, self.filename)
         self.setWindowTitle(title)
 
         if self.hasLabelFile():
@@ -757,7 +936,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.undo.setEnabled(self.canvas.isShapeRestorable)
 
     def tutorial(self):
-        url = 'https://github.com/wkentaro/labelme/tree/master/examples/tutorial'  # NOQA
+        url = "https://github.com/wkentaro/labelme/tree/main/examples/tutorial"  # NOQA
         webbrowser.open(url)
 
     def toggleDrawingSensitive(self, drawing=True):
@@ -770,7 +949,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.undo.setEnabled(not drawing)
         self.actions.delete.setEnabled(not drawing)
 
-    def toggleDrawMode(self, edit=True, createMode='polygon'):
+    def toggleDrawMode(self, edit=True, createMode="polygon"):
         self.canvas.setEditing(edit)
         self.canvas.createMode = createMode
         if edit:
@@ -781,28 +960,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self.actions.createPointMode.setEnabled(True)
             self.actions.createLineStripMode.setEnabled(True)
         else:
-            if createMode == 'polygon':
+            if createMode == "polygon":
                 self.actions.createMode.setEnabled(False)
                 self.actions.createRectangleMode.setEnabled(True)
                 self.actions.createCircleMode.setEnabled(True)
                 self.actions.createLineMode.setEnabled(True)
                 self.actions.createPointMode.setEnabled(True)
                 self.actions.createLineStripMode.setEnabled(True)
-            elif createMode == 'rectangle':
+            elif createMode == "rectangle":
                 self.actions.createMode.setEnabled(True)
                 self.actions.createRectangleMode.setEnabled(False)
                 self.actions.createCircleMode.setEnabled(True)
                 self.actions.createLineMode.setEnabled(True)
                 self.actions.createPointMode.setEnabled(True)
                 self.actions.createLineStripMode.setEnabled(True)
-            elif createMode == 'line':
+            elif createMode == "line":
                 self.actions.createMode.setEnabled(True)
                 self.actions.createRectangleMode.setEnabled(True)
                 self.actions.createCircleMode.setEnabled(True)
                 self.actions.createLineMode.setEnabled(False)
                 self.actions.createPointMode.setEnabled(True)
                 self.actions.createLineStripMode.setEnabled(True)
-            elif createMode == 'point':
+            elif createMode == "point":
                 self.actions.createMode.setEnabled(True)
                 self.actions.createRectangleMode.setEnabled(True)
                 self.actions.createCircleMode.setEnabled(True)
@@ -824,7 +1003,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.actions.createPointMode.setEnabled(True)
                 self.actions.createLineStripMode.setEnabled(False)
             else:
-                raise ValueError('Unsupported createMode: %s' % createMode)
+                raise ValueError("Unsupported createMode: %s" % createMode)
         self.actions.editMode.setEnabled(not edit)
 
     def setEditMode(self):
@@ -840,9 +1019,10 @@ class MainWindow(QtWidgets.QMainWindow):
         menu.clear()
         files = [f for f in self.recentFiles if f != current and exists(f)]
         for i, f in enumerate(files):
-            icon = utils.newIcon('labels')
+            icon = utils.newIcon("labels")
             action = QtWidgets.QAction(
-                icon, '&%d %s' % (i + 1, QtCore.QFileInfo(f).fileName()), self)
+                icon, "&%d %s" % (i + 1, QtCore.QFileInfo(f).fileName()), self
+            )
             action.triggered.connect(functools.partial(self.loadRecent, f))
             menu.addAction(action)
 
@@ -851,23 +1031,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def validateLabel(self, label):
         # no validation
-        if self._config['validate_label'] is None:
+        if self._config["validate_label"] is None:
             return True
 
         for i in range(self.uniqLabelList.count()):
-            label_i = self.uniqLabelList.item(i).text()
-            if self._config['validate_label'] in ['exact', 'instance']:
+            label_i = self.uniqLabelList.item(i).data(Qt.UserRole)
+            if self._config["validate_label"] in ["exact"]:
                 if label_i == label:
-                    return True
-            if self._config['validate_label'] == 'instance':
-                m = re.match(r'^{}-[0-9]*$'.format(label_i), label)
-                if m:
                     return True
         return False
 
-    def editLabel(self, item=False):
-        if item and not isinstance(item, QtWidgets.QListWidgetItem):
-            raise TypeError('unsupported type of item: {}'.format(type(item)))
+    def editLabel(self, item=None):
+        if item and not isinstance(item, LabelListWidgetItem):
+            raise TypeError("item must be LabelListWidgetItem type")
 
         if not self.canvas.editing():
             return
@@ -875,24 +1051,43 @@ class MainWindow(QtWidgets.QMainWindow):
             item = self.currentItem()
         if item is None:
             return
-        shape = self.labelList.get_shape_from_item(item)
+        shape = item.shape()
         if shape is None:
             return
-        text, flags = self.labelDialog.popUp(shape.label, flags=shape.flags)
+        text, flags, group_id = self.labelDialog.popUp(
+            text=shape.label,
+            flags=shape.flags,
+            group_id=shape.group_id,
+        )
         if text is None:
             return
         if not self.validateLabel(text):
-            self.errorMessage('Invalid label',
-                              "Invalid label '{}' with validation type '{}'"
-                              .format(text, self._config['validate_label']))
+            self.errorMessage(
+                self.tr("Invalid label"),
+                self.tr("Invalid label '{}' with validation type '{}'").format(
+                    text, self._config["validate_label"]
+                ),
+            )
             return
         shape.label = text
         shape.flags = flags
-        item.setText(text)
+        shape.group_id = group_id
+
+        self._update_shape_color(shape)
+        if shape.group_id is None:
+            item.setText(
+                '{} <font color="#{:02x}{:02x}{:02x}">●</font>'.format(
+                    html.escape(shape.label), *shape.fill_color.getRgb()[:3]
+                )
+            )
+        else:
+            item.setText("{} ({})".format(shape.label, shape.group_id))
         self.setDirty()
-        if not self.uniqLabelList.findItems(text, Qt.MatchExactly):
-            self.uniqLabelList.addItem(text)
-            self.uniqLabelList.sortItems()
+        if self.uniqLabelList.findItemByLabel(shape.label) is None:
+            item = self.uniqLabelList.createItemFromLabel(shape.label)
+            self.uniqLabelList.addItem(item)
+            rgb = self._get_rgb_by_label(shape.label)
+            self.uniqLabelList.setItemLabel(item, shape.label, rgb)
 
     def fileSearchChanged(self):
         self.importDirImages(
@@ -925,33 +1120,73 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas.selectedShapes = selected_shapes
         for shape in self.canvas.selectedShapes:
             shape.selected = True
-            item = self.labelList.get_item_from_shape(shape)
-            item.setSelected(True)
+            item = self.labelList.findItemByShape(shape)
+            self.labelList.selectItem(item)
+            self.labelList.scrollToItem(item)
         self._noSelectionSlot = False
         n_selected = len(selected_shapes)
         self.actions.delete.setEnabled(n_selected)
+        self.actions.duplicate.setEnabled(n_selected)
         self.actions.copy.setEnabled(n_selected)
         self.actions.edit.setEnabled(n_selected == 1)
-        self.actions.shapeLineColor.setEnabled(n_selected)
-        self.actions.shapeFillColor.setEnabled(n_selected)
 
     def addLabel(self, shape):
-        item = QtWidgets.QListWidgetItem(shape.label)
-        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-        item.setCheckState(Qt.Checked)
-        self.labelList.itemsToShapes.append((item, shape))
-        self.labelList.addItem(item)
-        if not self.uniqLabelList.findItems(shape.label, Qt.MatchExactly):
-            self.uniqLabelList.addItem(shape.label)
-            self.uniqLabelList.sortItems()
-        self.labelDialog.addLabelHistory(item.text())
+        if shape.group_id is None:
+            text = shape.label
+        else:
+            text = "{} ({})".format(shape.label, shape.group_id)
+        label_list_item = LabelListWidgetItem(text, shape)
+        self.labelList.addItem(label_list_item)
+        if self.uniqLabelList.findItemByLabel(shape.label) is None:
+            item = self.uniqLabelList.createItemFromLabel(shape.label)
+            self.uniqLabelList.addItem(item)
+            rgb = self._get_rgb_by_label(shape.label)
+            self.uniqLabelList.setItemLabel(item, shape.label, rgb)
+        self.labelDialog.addLabelHistory(shape.label)
         for action in self.actions.onShapesPresent:
             action.setEnabled(True)
 
+        self._update_shape_color(shape)
+        label_list_item.setText(
+            '{} <font color="#{:02x}{:02x}{:02x}">●</font>'.format(
+                html.escape(text), *shape.fill_color.getRgb()[:3]
+            )
+        )
+
+    def _update_shape_color(self, shape):
+        r, g, b = self._get_rgb_by_label(shape.label)
+        shape.line_color = QtGui.QColor(r, g, b)
+        shape.vertex_fill_color = QtGui.QColor(r, g, b)
+        shape.hvertex_fill_color = QtGui.QColor(255, 255, 255)
+        shape.fill_color = QtGui.QColor(r, g, b, 128)
+        shape.select_line_color = QtGui.QColor(255, 255, 255)
+        shape.select_fill_color = QtGui.QColor(r, g, b, 155)
+
+    def _get_rgb_by_label(self, label):
+        if self._config["shape_color"] == "auto":
+            item = self.uniqLabelList.findItemByLabel(label)
+            if item is None:
+                item = self.uniqLabelList.createItemFromLabel(label)
+                self.uniqLabelList.addItem(item)
+                rgb = self._get_rgb_by_label(label)
+                self.uniqLabelList.setItemLabel(item, label, rgb)
+            label_id = self.uniqLabelList.indexFromItem(item).row() + 1
+            label_id += self._config["shift_auto_shape_color"]
+            return LABEL_COLORMAP[label_id % len(LABEL_COLORMAP)]
+        elif (
+            self._config["shape_color"] == "manual"
+            and self._config["label_colors"]
+            and label in self._config["label_colors"]
+        ):
+            return self._config["label_colors"][label]
+        elif self._config["default_shape_color"]:
+            return self._config["default_shape_color"]
+        return (0, 255, 0)
+
     def remLabels(self, shapes):
         for shape in shapes:
-            item = self.labelList.get_item_from_shape(shape)
-            self.labelList.takeItem(self.labelList.row(item))
+            item = self.labelList.findItemByShape(shape)
+            self.labelList.removeItem(item)
 
     def loadShapes(self, shapes, replace=True):
         self._noSelectionSlot = True
@@ -963,26 +1198,36 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def loadLabels(self, shapes):
         s = []
-        for label, points, line_color, fill_color, shape_type, flags in shapes:
-            shape = Shape(label=label, shape_type=shape_type)
+        for shape in shapes:
+            label = shape["label"]
+            points = shape["points"]
+            shape_type = shape["shape_type"]
+            flags = shape["flags"]
+            group_id = shape["group_id"]
+            other_data = shape["other_data"]
+
+            if not points:
+                # skip point-empty shape
+                continue
+
+            shape = Shape(
+                label=label,
+                shape_type=shape_type,
+                group_id=group_id,
+            )
             for x, y in points:
                 shape.addPoint(QtCore.QPointF(x, y))
             shape.close()
 
-            if line_color:
-                shape.line_color = QtGui.QColor(*line_color)
-
-            if fill_color:
-                shape.fill_color = QtGui.QColor(*fill_color)
-
             default_flags = {}
-            if self._config['label_flags']:
-                for pattern, keys in self._config['label_flags'].items():
+            if self._config["label_flags"]:
+                for pattern, keys in self._config["label_flags"].items():
                     if re.match(pattern, label):
                         for key in keys:
                             default_flags[key] = False
             shape.flags = default_flags
             shape.flags.update(flags)
+            shape.other_data = other_data
 
             s.append(shape)
         self.loadShapes(s)
@@ -999,18 +1244,19 @@ class MainWindow(QtWidgets.QMainWindow):
         lf = LabelFile()
 
         def format_shape(s):
-            return dict(
-                label=s.label.encode('utf-8') if PY2 else s.label,
-                line_color=s.line_color.getRgb()
-                if s.line_color != self.lineColor else None,
-                fill_color=s.fill_color.getRgb()
-                if s.fill_color != self.fillColor else None,
-                points=[(p.x(), p.y()) for p in s.points],
-                shape_type=s.shape_type,
-                flags=s.flags
+            data = s.other_data.copy()
+            data.update(
+                dict(
+                    label=s.label.encode("utf-8") if PY2 else s.label,
+                    points=[(p.x(), p.y()) for p in s.points],
+                    group_id=s.group_id,
+                    shape_type=s.shape_type,
+                    flags=s.flags,
+                )
             )
+            return data
 
-        shapes = [format_shape(shape) for shape in self.labelList.shapes]
+        shapes = [format_shape(item.shape()) for item in self.labelList]
         flags = {}
         for i in range(self.flag_widget.count()):
             item = self.flag_widget.item(i)
@@ -1018,9 +1264,8 @@ class MainWindow(QtWidgets.QMainWindow):
             flag = item.checkState() == Qt.Checked
             flags[key] = flag
         try:
-            imagePath = osp.relpath(
-                self.imagePath, osp.dirname(filename))
-            imageData = self.imageData if self._config['store_data'] else None
+            imagePath = osp.relpath(self.imagePath, osp.dirname(filename))
+            imageData = self.imageData if self._config["store_data"] else None
             if osp.dirname(filename) and not osp.exists(osp.dirname(filename)):
                 os.makedirs(osp.dirname(filename))
             lf.save(
@@ -1030,8 +1275,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 imageData=imageData,
                 imageHeight=self.image.height(),
                 imageWidth=self.image.width(),
-                lineColor=self.lineColor.getRgb(),
-                fillColor=self.fillColor.getRgb(),
                 otherData=self.otherData,
                 flags=flags,
             )
@@ -1041,21 +1284,31 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if len(items) > 0:
                 if len(items) != 1:
-                    raise RuntimeError('There are duplicate files.')
+                    raise RuntimeError("There are duplicate files.")
                 items[0].setCheckState(Qt.Checked)
             # disable allows next and previous image to proceed
             # self.filename = filename
             return True
         except LabelFileError as e:
-            self.errorMessage('Error saving label data', '<b>%s</b>' % e)
+            self.errorMessage(
+                self.tr("Error saving label data"), self.tr("<b>%s</b>") % e
+            )
             return False
 
-    def copySelectedShape(self):
-        added_shapes = self.canvas.copySelectedShapes()
+    def duplicateSelectedShape(self):
+        added_shapes = self.canvas.duplicateSelectedShapes()
         self.labelList.clearSelection()
         for shape in added_shapes:
             self.addLabel(shape)
         self.setDirty()
+
+    def pasteSelectedShape(self):
+        self.loadShapes(self._copied_shapes, replace=False)
+        self.setDirty()
+
+    def copySelectedShape(self):
+        self._copied_shapes = [s.copy() for s in self.canvas.selectedShapes]
+        self.actions.paste.setEnabled(len(self._copied_shapes) > 0)
 
     def labelSelectionChanged(self):
         if self._noSelectionSlot:
@@ -1063,19 +1316,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.canvas.editing():
             selected_shapes = []
             for item in self.labelList.selectedItems():
-                shape = self.labelList.get_shape_from_item(item)
-                selected_shapes.append(shape)
+                selected_shapes.append(item.shape())
             if selected_shapes:
                 self.canvas.selectShapes(selected_shapes)
+            else:
+                self.canvas.deSelectShape()
 
     def labelItemChanged(self, item):
-        shape = self.labelList.get_shape_from_item(item)
-        label = str(item.text())
-        if label != shape.label:
-            shape.label = str(item.text())
-            self.setDirty()
-        else:  # User probably changed item visibility
-            self.canvas.setShapeVisible(shape, item.checkState() == Qt.Checked)
+        shape = item.shape()
+        self.canvas.setShapeVisible(shape, item.checkState() == Qt.Checked)
+
+    def labelOrderChanged(self):
+        self.setDirty()
+        self.canvas.loadShapes([item.shape() for item in self.labelList])
 
     # Callback functions:
 
@@ -1086,33 +1339,29 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         items = self.uniqLabelList.selectedItems()
         text = None
-        flags = {}
         if items:
-            text = items[0].text()
-        if self._config['display_label_popup'] or not text:
-            # instance label auto increment
-            if self._config['instance_label_auto_increment']:
-                previous_label = self.labelDialog.edit.text()
-                split = previous_label.split('-')
-                if len(split) > 1 and split[-1].isdigit():
-                    split[-1] = str(int(split[-1]) + 1)
-                    instance_text = '-'.join(split)
-                else:
-                    instance_text = previous_label
-                if instance_text != '':
-                    text = instance_text
-            text, flags = self.labelDialog.popUp(text)
-            if text is None:
-                self.labelDialog.edit.setText(previous_label)
+            text = items[0].data(Qt.UserRole)
+        flags = {}
+        group_id = None
+        if self._config["display_label_popup"] or not text:
+            previous_text = self.labelDialog.edit.text()
+            text, flags, group_id = self.labelDialog.popUp(text)
+            if not text:
+                self.labelDialog.edit.setText(previous_text)
 
         if text and not self.validateLabel(text):
-            self.errorMessage('Invalid label',
-                              "Invalid label '{}' with validation type '{}'"
-                              .format(text, self._config['validate_label']))
-            text = ''
+            self.errorMessage(
+                self.tr("Invalid label"),
+                self.tr("Invalid label '{}' with validation type '{}'").format(
+                    text, self._config["validate_label"]
+                ),
+            )
+            text = ""
         if text:
             self.labelList.clearSelection()
-            self.addLabel(self.canvas.setLastLabel(text, flags))
+            shape = self.canvas.setLastLabel(text, flags)
+            shape.group_id = group_id
+            self.addLabel(shape)
             self.actions.editMode.setEnabled(True)
             self.actions.undoLastPoint.setEnabled(False)
             self.actions.undo.setEnabled(True)
@@ -1122,18 +1371,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self.canvas.shapesBackups.pop()
 
     def scrollRequest(self, delta, orientation):
-        units = - delta * 0.1  # natural scroll
+        units = -delta * 0.1  # natural scroll
         bar = self.scrollBars[orientation]
-        bar.setValue(bar.value() + bar.singleStep() * units)
+        value = bar.value() + bar.singleStep() * units
+        self.setScroll(orientation, value)
+
+    def setScroll(self, orientation, value):
+        self.scrollBars[orientation].setValue(int(value))
+        self.scroll_values[orientation][self.filename] = value
 
     def setZoom(self, value):
         self.actions.fitWidth.setChecked(False)
         self.actions.fitWindow.setChecked(False)
         self.zoomMode = self.MANUAL_ZOOM
         self.zoomWidget.setValue(value)
+        self.zoom_values[self.filename] = (self.zoomMode, value)
 
     def addZoom(self, increment=1.1):
-        self.setZoom(self.zoomWidget.value() * increment)
+        zoom_value = self.zoomWidget.value() * increment
+        if increment > 1:
+            zoom_value = math.ceil(zoom_value)
+        else:
+            zoom_value = math.floor(zoom_value)
+        self.setZoom(zoom_value)
 
     def zoomRequest(self, delta, pos):
         canvas_width_old = self.canvas.width()
@@ -1149,10 +1409,14 @@ class MainWindow(QtWidgets.QMainWindow):
             x_shift = round(pos.x() * canvas_scale_factor) - pos.x()
             y_shift = round(pos.y() * canvas_scale_factor) - pos.y()
 
-            self.scrollBars[Qt.Horizontal].setValue(
-                self.scrollBars[Qt.Horizontal].value() + x_shift)
-            self.scrollBars[Qt.Vertical].setValue(
-                self.scrollBars[Qt.Vertical].value() + y_shift)
+            self.setScroll(
+                Qt.Horizontal,
+                self.scrollBars[Qt.Horizontal].value() + x_shift,
+            )
+            self.setScroll(
+                Qt.Vertical,
+                self.scrollBars[Qt.Vertical].value() + y_shift,
+            )
 
     def setFitWindow(self, value=True):
         if value:
@@ -1166,16 +1430,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.zoomMode = self.FIT_WIDTH if value else self.MANUAL_ZOOM
         self.adjustScale()
 
+    def enableKeepPrevScale(self, enabled):
+        self._config["keep_prev_scale"] = enabled
+        self.actions.keepPrevScale.setChecked(enabled)
+
+    def onNewBrightnessContrast(self, qimage):
+        self.canvas.loadPixmap(
+            QtGui.QPixmap.fromImage(qimage), clear_shapes=False
+        )
+
+    def brightnessContrast(self, value):
+        dialog = BrightnessContrastDialog(
+            utils.img_data_to_pil(self.imageData),
+            self.onNewBrightnessContrast,
+            parent=self,
+        )
+        brightness, contrast = self.brightnessContrast_values.get(
+            self.filename, (None, None)
+        )
+        if brightness is not None:
+            dialog.slider_brightness.setValue(brightness)
+        if contrast is not None:
+            dialog.slider_contrast.setValue(contrast)
+        dialog.exec_()
+
+        brightness = dialog.slider_brightness.value()
+        contrast = dialog.slider_contrast.value()
+        self.brightnessContrast_values[self.filename] = (brightness, contrast)
+
     def togglePolygons(self, value):
-        for item, shape in self.labelList.itemsToShapes:
+        for item in self.labelList:
             item.setCheckState(Qt.Checked if value else Qt.Unchecked)
 
     def loadFile(self, filename=None):
         """Load the specified file, or the last opened file if None."""
         # changing fileListWidget loads file
-        if (filename in self.imageList and
-                self.fileListWidget.currentRow() !=
-                self.imageList.index(filename)):
+        if filename in self.imageList and (
+            self.fileListWidget.currentRow() != self.imageList.index(filename)
+        ):
             self.fileListWidget.setCurrentRow(self.imageList.index(filename))
             self.fileListWidget.repaint()
             return
@@ -1183,39 +1475,43 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resetState()
         self.canvas.setEnabled(False)
         if filename is None:
-            filename = self.settings.value('filename', '')
+            filename = self.settings.value("filename", "")
         filename = str(filename)
         if not QtCore.QFile.exists(filename):
             self.errorMessage(
-                'Error opening file', 'No such file: <b>%s</b>' % filename)
+                self.tr("Error opening file"),
+                self.tr("No such file: <b>%s</b>") % filename,
+            )
             return False
         # assumes same name, but json extension
-        self.status("Loading %s..." % osp.basename(str(filename)))
-        label_file = osp.splitext(filename)[0] + '.json'
+        self.status(
+            str(self.tr("Loading %s...")) % osp.basename(str(filename))
+        )
+        label_file = osp.splitext(filename)[0] + ".json"
         if self.output_dir:
             label_file_without_path = osp.basename(label_file)
             label_file = osp.join(self.output_dir, label_file_without_path)
-        if QtCore.QFile.exists(label_file) and \
-                LabelFile.is_label_file(label_file):
+        if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(
+            label_file
+        ):
             try:
                 self.labelFile = LabelFile(label_file)
             except LabelFileError as e:
                 self.errorMessage(
-                    'Error opening file',
-                    "<p><b>%s</b></p>"
-                    "<p>Make sure <i>%s</i> is a valid label file."
-                    % (e, label_file))
-                self.status("Error reading %s" % label_file)
+                    self.tr("Error opening file"),
+                    self.tr(
+                        "<p><b>%s</b></p>"
+                        "<p>Make sure <i>%s</i> is a valid label file."
+                    )
+                    % (e, label_file),
+                )
+                self.status(self.tr("Error reading %s") % label_file)
                 return False
             self.imageData = self.labelFile.imageData
             self.imagePath = osp.join(
                 osp.dirname(label_file),
                 self.labelFile.imagePath,
             )
-            if self.labelFile.lineColor is not None:
-                self.lineColor = QtGui.QColor(*self.labelFile.lineColor)
-            if self.labelFile.fillColor is not None:
-                self.fillColor = QtGui.QColor(*self.labelFile.fillColor)
             self.otherData = self.labelFile.otherData
         else:
             self.imageData = LabelFile.load_image_file(filename)
@@ -1225,40 +1521,86 @@ class MainWindow(QtWidgets.QMainWindow):
         image = QtGui.QImage.fromData(self.imageData)
 
         if image.isNull():
-            formats = ['*.{}'.format(fmt.data().decode())
-                       for fmt in QtGui.QImageReader.supportedImageFormats()]
+            formats = [
+                "*.{}".format(fmt.data().decode())
+                for fmt in QtGui.QImageReader.supportedImageFormats()
+            ]
             self.errorMessage(
-                'Error opening file',
-                '<p>Make sure <i>{0}</i> is a valid image file.<br/>'
-                'Supported image formats: {1}</p>'
-                .format(filename, ','.join(formats)))
-            self.status("Error reading %s" % filename)
+                self.tr("Error opening file"),
+                self.tr(
+                    "<p>Make sure <i>{0}</i> is a valid image file.<br/>"
+                    "Supported image formats: {1}</p>"
+                ).format(filename, ",".join(formats)),
+            )
+            self.status(self.tr("Error reading %s") % filename)
             return False
         self.image = image
         self.filename = filename
-        if self._config['keep_prev']:
+        if self._config["keep_prev"]:
             prev_shapes = self.canvas.shapes
         self.canvas.loadPixmap(QtGui.QPixmap.fromImage(image))
-        if self._config['flags']:
-            self.loadFlags({k: False for k in self._config['flags']})
+        flags = {k: False for k in self._config["flags"] or []}
         if self.labelFile:
             self.loadLabels(self.labelFile.shapes)
             if self.labelFile.flags is not None:
-                self.loadFlags(self.labelFile.flags)
-        if self._config['keep_prev'] and not self.labelList.shapes:
+                flags.update(self.labelFile.flags)
+        self.loadFlags(flags)
+        if self._config["keep_prev"] and self.noShapes():
             self.loadShapes(prev_shapes, replace=False)
-        self.setClean()
+            self.setDirty()
+        else:
+            self.setClean()
         self.canvas.setEnabled(True)
-        self.adjustScale(initial=True)
+        # set zoom values
+        is_initial_load = not self.zoom_values
+        if self.filename in self.zoom_values:
+            self.zoomMode = self.zoom_values[self.filename][0]
+            self.setZoom(self.zoom_values[self.filename][1])
+        elif is_initial_load or not self._config["keep_prev_scale"]:
+            self.adjustScale(initial=True)
+        # set scroll values
+        for orientation in self.scroll_values:
+            if self.filename in self.scroll_values[orientation]:
+                self.setScroll(
+                    orientation, self.scroll_values[orientation][self.filename]
+                )
+        # set brightness contrast values
+        dialog = BrightnessContrastDialog(
+            utils.img_data_to_pil(self.imageData),
+            self.onNewBrightnessContrast,
+            parent=self,
+        )
+        brightness, contrast = self.brightnessContrast_values.get(
+            self.filename, (None, None)
+        )
+        if self._config["keep_prev_brightness"] and self.recentFiles:
+            brightness, _ = self.brightnessContrast_values.get(
+                self.recentFiles[0], (None, None)
+            )
+        if self._config["keep_prev_contrast"] and self.recentFiles:
+            _, contrast = self.brightnessContrast_values.get(
+                self.recentFiles[0], (None, None)
+            )
+        if brightness is not None:
+            dialog.slider_brightness.setValue(brightness)
+        if contrast is not None:
+            dialog.slider_contrast.setValue(contrast)
+        self.brightnessContrast_values[self.filename] = (brightness, contrast)
+        if brightness is not None or contrast is not None:
+            dialog.onNewValue(None)
         self.paintCanvas()
         self.addRecentFile(self.filename)
         self.toggleActions(True)
-        self.status("Loaded %s" % osp.basename(str(filename)))
+        self.canvas.setFocus()
+        self.status(str(self.tr("Loaded %s")) % osp.basename(str(filename)))
         return True
 
     def resizeEvent(self, event):
-        if self.canvas and not self.image.isNull()\
-           and self.zoomMode != self.MANUAL_ZOOM:
+        if (
+            self.canvas
+            and not self.image.isNull()
+            and self.zoomMode != self.MANUAL_ZOOM
+        ):
             self.adjustScale()
         super(MainWindow, self).resizeEvent(event)
 
@@ -1270,7 +1612,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def adjustScale(self, initial=False):
         value = self.scalers[self.FIT_WINDOW if initial else self.zoomMode]()
-        self.zoomWidget.setValue(int(100 * value))
+        value = int(100 * value)
+        self.zoomWidget.setValue(value)
+        self.zoom_values[self.filename] = (self.zoomMode, value)
 
     def scaleFitWindow(self):
         """Figure out the size of the pixmap to fit the main widget."""
@@ -1289,19 +1633,41 @@ class MainWindow(QtWidgets.QMainWindow):
         w = self.centralWidget().width() - 2.0
         return w / self.canvas.pixmap.width()
 
+    def enableSaveImageWithData(self, enabled):
+        self._config["store_data"] = enabled
+        self.actions.saveWithImageData.setChecked(enabled)
+
     def closeEvent(self, event):
         if not self.mayContinue():
             event.ignore()
         self.settings.setValue(
-            'filename', self.filename if self.filename else '')
-        self.settings.setValue('window/size', self.size())
-        self.settings.setValue('window/position', self.pos())
-        self.settings.setValue('window/state', self.saveState())
-        self.settings.setValue('line/color', self.lineColor)
-        self.settings.setValue('fill/color', self.fillColor)
-        self.settings.setValue('recentFiles', self.recentFiles)
+            "filename", self.filename if self.filename else ""
+        )
+        self.settings.setValue("window/size", self.size())
+        self.settings.setValue("window/position", self.pos())
+        self.settings.setValue("window/state", self.saveState())
+        self.settings.setValue("recentFiles", self.recentFiles)
         # ask the use for where to save the labels
         # self.settings.setValue('window/geometry', self.saveGeometry())
+
+    def dragEnterEvent(self, event):
+        extensions = [
+            ".%s" % fmt.data().decode().lower()
+            for fmt in QtGui.QImageReader.supportedImageFormats()
+        ]
+        if event.mimeData().hasUrls():
+            items = [i.toLocalFile() for i in event.mimeData().urls()]
+            if any([i.lower().endswith(tuple(extensions)) for i in items]):
+                event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not self.mayContinue():
+            event.ignore()
+            return
+        items = [i.toLocalFile() for i in event.mimeData().urls()]
+        self.importDroppedImageFiles(items)
 
     # User Dialogs #
 
@@ -1310,10 +1676,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.loadFile(filename)
 
     def openPrevImg(self, _value=False):
-        keep_prev = self._config['keep_prev']
-        if QtGui.QGuiApplication.keyboardModifiers() == \
-                (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
-            self._config['keep_prev'] = True
+        keep_prev = self._config["keep_prev"]
+        if QtWidgets.QApplication.keyboardModifiers() == (
+            Qt.ControlModifier | Qt.ShiftModifier
+        ):
+            self._config["keep_prev"] = True
 
         if not self.mayContinue():
             return
@@ -1330,13 +1697,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if filename:
                 self.loadFile(filename)
 
-        self._config['keep_prev'] = keep_prev
+        self._config["keep_prev"] = keep_prev
 
     def openNextImg(self, _value=False, load=True):
-        keep_prev = self._config['keep_prev']
-        if QtGui.QGuiApplication.keyboardModifiers() == \
-                (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
-            self._config['keep_prev'] = True
+        keep_prev = self._config["keep_prev"]
+        if QtWidgets.QApplication.keyboardModifiers() == (
+            Qt.ControlModifier | Qt.ShiftModifier
+        ):
+            self._config["keep_prev"] = True
 
         if not self.mayContinue():
             return
@@ -1358,24 +1726,31 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.filename and load:
             self.loadFile(self.filename)
 
-        self._config['keep_prev'] = keep_prev
+        self._config["keep_prev"] = keep_prev
 
     def openFile(self, _value=False):
         if not self.mayContinue():
             return
-        path = osp.dirname(str(self.filename)) if self.filename else '.'
-        formats = ['*.{}'.format(fmt.data().decode())
-                   for fmt in QtGui.QImageReader.supportedImageFormats()]
-        filters = "Image & Label files (%s)" % ' '.join(
-            formats + ['*%s' % LabelFile.suffix])
-        filename = QtWidgets.QFileDialog.getOpenFileName(
-            self, '%s - Choose Image or Label file' % __appname__,
-            path, filters)
-        if QT5:
-            filename, _ = filename
-        filename = str(filename)
-        if filename:
-            self.loadFile(filename)
+        path = osp.dirname(str(self.filename)) if self.filename else "."
+        formats = [
+            "*.{}".format(fmt.data().decode())
+            for fmt in QtGui.QImageReader.supportedImageFormats()
+        ]
+        filters = self.tr("Image & Label files (%s)") % " ".join(
+            formats + ["*%s" % LabelFile.suffix]
+        )
+        fileDialog = FileDialogPreview(self)
+        fileDialog.setFileMode(FileDialogPreview.ExistingFile)
+        fileDialog.setNameFilter(filters)
+        fileDialog.setWindowTitle(
+            self.tr("%s - Choose Image or Label file") % __appname__,
+        )
+        fileDialog.setWindowFilePath(path)
+        fileDialog.setViewMode(FileDialogPreview.Detail)
+        if fileDialog.exec_():
+            fileName = fileDialog.selectedFiles()[0]
+            if fileName:
+                self.loadFile(fileName)
 
     def changeOutputDirDialog(self, _value=False):
         default_output_dir = self.output_dir
@@ -1385,10 +1760,11 @@ class MainWindow(QtWidgets.QMainWindow):
             default_output_dir = self.currentPath()
 
         output_dir = QtWidgets.QFileDialog.getExistingDirectory(
-            self, '%s - Save/Load Annotations in Directory' % __appname__,
+            self,
+            self.tr("%s - Save/Load Annotations in Directory") % __appname__,
             default_output_dir,
-            QtWidgets.QFileDialog.ShowDirsOnly |
-            QtWidgets.QFileDialog.DontResolveSymlinks,
+            QtWidgets.QFileDialog.ShowDirsOnly
+            | QtWidgets.QFileDialog.DontResolveSymlinks,
         )
         output_dir = str(output_dir)
 
@@ -1398,8 +1774,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.output_dir = output_dir
 
         self.statusBar().showMessage(
-            '%s . Annotations will be saved/loaded in %s' %
-            ('Change Annotations Dir', self.output_dir))
+            self.tr("%s . Annotations will be saved/loaded in %s")
+            % ("Change Annotations Dir", self.output_dir)
+        )
         self.statusBar().show()
 
         current_filename = self.filename
@@ -1408,29 +1785,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if current_filename in self.imageList:
             # retain currently selected file
             self.fileListWidget.setCurrentRow(
-                self.imageList.index(current_filename))
+                self.imageList.index(current_filename)
+            )
             self.fileListWidget.repaint()
 
     def saveFile(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
-        if self._config['flags'] or self.hasLabels():
-            if self.labelFile:
-                # DL20180323 - overwrite when in directory
-                self._saveFile(self.labelFile.filename)
-            elif self.output_file:
-                self._saveFile(self.output_file)
-                self.close()
-            else:
-                self._saveFile(self.saveFileDialog())
+        if self.labelFile:
+            # DL20180323 - overwrite when in directory
+            self._saveFile(self.labelFile.filename)
+        elif self.output_file:
+            self._saveFile(self.output_file)
+            self.close()
+        else:
+            self._saveFile(self.saveFileDialog())
 
     def saveFileAs(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
-        if self.hasLabels():
-            self._saveFile(self.saveFileDialog())
+        self._saveFile(self.saveFileDialog())
 
     def saveFileDialog(self):
-        caption = '%s - Choose File' % __appname__
-        filters = 'Label files (*%s)' % LabelFile.suffix
+        caption = self.tr("%s - Choose File") % __appname__
+        filters = self.tr("Label files (*%s)") % LabelFile.suffix
         if self.output_dir:
             dlg = QtWidgets.QFileDialog(
                 self, caption, self.output_dir, filters
@@ -1453,11 +1829,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.currentPath(), basename + LabelFile.suffix
             )
         filename = dlg.getSaveFileName(
-            self, 'Choose File', default_labelfile_name,
-            'Label files (*%s)' % LabelFile.suffix)
-        if QT5:
+            self,
+            self.tr("Choose File"),
+            default_labelfile_name,
+            self.tr("Label files (*%s)") % LabelFile.suffix,
+        )
+        if isinstance(filename, tuple):
             filename, _ = filename
-        filename = str(filename)
         return filename
 
     def _saveFile(self, filename):
@@ -1475,25 +1853,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.saveAs.setEnabled(False)
 
     def getLabelFile(self):
-        if self.filename.lower().endswith('.json'):
+        if self.filename.lower().endswith(".json"):
             label_file = self.filename
         else:
-            label_file = osp.splitext(self.filename)[0] + '.json'
+            label_file = osp.splitext(self.filename)[0] + ".json"
 
         return label_file
 
     def deleteFile(self):
         mb = QtWidgets.QMessageBox
-        msg = 'You are about to permanently delete this label file, ' \
-              'proceed anyway?'
-        answer = mb.warning(self, 'Attention', msg, mb.Yes | mb.No)
+        msg = self.tr(
+            "You are about to permanently delete this label file, "
+            "proceed anyway?"
+        )
+        answer = mb.warning(self, self.tr("Attention"), msg, mb.Yes | mb.No)
         if answer != mb.Yes:
             return
 
         label_file = self.getLabelFile()
         if osp.exists(label_file):
             os.remove(label_file)
-            logger.info('Label file is removed: {}'.format(label_file))
+            logger.info("Label file is removed: {}".format(label_file))
 
             item = self.fileListWidget.currentItem()
             item.setCheckState(Qt.Unchecked)
@@ -1502,10 +1882,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # Message Dialogs. #
     def hasLabels(self):
-        if not self.labelList.itemsToShapes:
+        if self.noShapes():
             self.errorMessage(
-                'No objects labeled',
-                'You must label at least one object to save the file.')
+                "No objects labeled",
+                "You must label at least one object to save the file.",
+            )
             return False
         return True
 
@@ -1520,12 +1901,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.dirty:
             return True
         mb = QtWidgets.QMessageBox
-        msg = 'Save annotations to "{}" before closing?'.format(self.filename)
-        answer = mb.question(self,
-                             'Save annotations?',
-                             msg,
-                             mb.Save | mb.Discard | mb.Cancel,
-                             mb.Save)
+        msg = self.tr('Save annotations to "{}" before closing?').format(
+            self.filename
+        )
+        answer = mb.question(
+            self,
+            self.tr("Save annotations?"),
+            msg,
+            mb.Save | mb.Discard | mb.Cancel,
+            mb.Save,
+        )
         if answer == mb.Discard:
             return True
         elif answer == mb.Save:
@@ -1536,68 +1921,46 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def errorMessage(self, title, message):
         return QtWidgets.QMessageBox.critical(
-            self, title, '<p><b>%s</b></p>%s' % (title, message))
+            self, title, "<p><b>%s</b></p>%s" % (title, message)
+        )
 
     def currentPath(self):
-        return osp.dirname(str(self.filename)) if self.filename else '.'
-
-    def chooseColor1(self):
-        color = self.colorDialog.getColor(
-            self.lineColor, 'Choose line color', default=DEFAULT_LINE_COLOR)
-        if color:
-            self.lineColor = color
-            # Change the color for all shape lines:
-            Shape.line_color = self.lineColor
-            self.canvas.update()
-            self.setDirty()
-
-    def chooseColor2(self):
-        color = self.colorDialog.getColor(
-            self.fillColor, 'Choose fill color', default=DEFAULT_FILL_COLOR)
-        if color:
-            self.fillColor = color
-            Shape.fill_color = self.fillColor
-            self.canvas.update()
-            self.setDirty()
+        return osp.dirname(str(self.filename)) if self.filename else "."
 
     def toggleKeepPrevMode(self):
-        self._config['keep_prev'] = not self._config['keep_prev']
+        self._config["keep_prev"] = not self._config["keep_prev"]
+
+    def removeSelectedPoint(self):
+        self.canvas.removeSelectedPoint()
+        self.canvas.update()
+        if not self.canvas.hShape.points:
+            self.canvas.deleteShape(self.canvas.hShape)
+            self.remLabels([self.canvas.hShape])
+            if self.noShapes():
+                for action in self.actions.onShapesPresent:
+                    action.setEnabled(False)
+        self.setDirty()
 
     def deleteSelectedShape(self):
         yes, no = QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No
-        msg = 'You are about to permanently delete {} polygons, ' \
-              'proceed anyway?'.format(len(self.canvas.selectedShapes))
-        if yes == QtWidgets.QMessageBox.warning(self, 'Attention', msg,
-                                                yes | no):
+        msg = self.tr(
+            "You are about to permanently delete {} polygons, "
+            "proceed anyway?"
+        ).format(len(self.canvas.selectedShapes))
+        if yes == QtWidgets.QMessageBox.warning(
+            self, self.tr("Attention"), msg, yes | no, yes
+        ):
             self.remLabels(self.canvas.deleteSelected())
             self.setDirty()
             if self.noShapes():
                 for action in self.actions.onShapesPresent:
                     action.setEnabled(False)
 
-    def chshapeLineColor(self):
-        color = self.colorDialog.getColor(
-            self.lineColor, 'Choose line color', default=DEFAULT_LINE_COLOR)
-        if color:
-            for shape in self.canvas.selectedShapes:
-                shape.line_color = color
-            self.canvas.update()
-            self.setDirty()
-
-    def chshapeFillColor(self):
-        color = self.colorDialog.getColor(
-            self.fillColor, 'Choose fill color', default=DEFAULT_FILL_COLOR)
-        if color:
-            for shape in self.canvas.selectedShapes:
-                shape.fill_color = color
-            self.canvas.update()
-            self.setDirty()
-
     def copyShape(self):
         self.canvas.endMove(copy=True)
-        self.labelList.clearSelection()
         for shape in self.canvas.selectedShapes:
             self.addLabel(shape)
+        self.labelList.clearSelection()
         self.setDirty()
 
     def moveShape(self):
@@ -1608,17 +1971,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.mayContinue():
             return
 
-        defaultOpenDirPath = dirpath if dirpath else '.'
+        defaultOpenDirPath = dirpath if dirpath else "."
         if self.lastOpenDir and osp.exists(self.lastOpenDir):
             defaultOpenDirPath = self.lastOpenDir
         else:
-            defaultOpenDirPath = osp.dirname(self.filename) \
-                if self.filename else '.'
+            defaultOpenDirPath = (
+                osp.dirname(self.filename) if self.filename else "."
+            )
 
-        targetDirPath = str(QtWidgets.QFileDialog.getExistingDirectory(
-            self, '%s - Open Directory' % __appname__, defaultOpenDirPath,
-            QtWidgets.QFileDialog.ShowDirsOnly |
-            QtWidgets.QFileDialog.DontResolveSymlinks))
+        targetDirPath = str(
+            QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                self.tr("%s - Open Directory") % __appname__,
+                defaultOpenDirPath,
+                QtWidgets.QFileDialog.ShowDirsOnly
+                | QtWidgets.QFileDialog.DontResolveSymlinks,
+            )
+        )
         self.importDirImages(targetDirPath)
 
     @property
@@ -1628,6 +1997,38 @@ class MainWindow(QtWidgets.QMainWindow):
             item = self.fileListWidget.item(i)
             lst.append(item.text())
         return lst
+
+    def importDroppedImageFiles(self, imageFiles):
+        extensions = [
+            ".%s" % fmt.data().decode().lower()
+            for fmt in QtGui.QImageReader.supportedImageFormats()
+        ]
+
+        self.filename = None
+        for file in imageFiles:
+            if file in self.imageList or not file.lower().endswith(
+                tuple(extensions)
+            ):
+                continue
+            label_file = osp.splitext(file)[0] + ".json"
+            if self.output_dir:
+                label_file_without_path = osp.basename(label_file)
+                label_file = osp.join(self.output_dir, label_file_without_path)
+            item = QtWidgets.QListWidgetItem(file)
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(
+                label_file
+            ):
+                item.setCheckState(Qt.Checked)
+            else:
+                item.setCheckState(Qt.Unchecked)
+            self.fileListWidget.addItem(item)
+
+        if len(self.imageList) > 1:
+            self.actions.openNextImg.setEnabled(True)
+            self.actions.openPrevImg.setEnabled(True)
+
+        self.openNextImg()
 
     def importDirImages(self, dirpath, pattern=None, load=True):
         self.actions.openNextImg.setEnabled(True)
@@ -1642,14 +2043,15 @@ class MainWindow(QtWidgets.QMainWindow):
         for filename in self.scanAllImages(dirpath):
             if pattern and pattern not in filename:
                 continue
-            label_file = osp.splitext(filename)[0] + '.json'
+            label_file = osp.splitext(filename)[0] + ".json"
             if self.output_dir:
                 label_file_without_path = osp.basename(label_file)
                 label_file = osp.join(self.output_dir, label_file_without_path)
             item = QtWidgets.QListWidgetItem(filename)
             item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            if QtCore.QFile.exists(label_file) and \
-                    LabelFile.is_label_file(label_file):
+            if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(
+                label_file
+            ):
                 item.setCheckState(Qt.Checked)
             else:
                 item.setCheckState(Qt.Unchecked)
@@ -1657,14 +2059,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.openNextImg(load=load)
 
     def scanAllImages(self, folderPath):
-        extensions = ['.%s' % fmt.data().decode("ascii").lower()
-                      for fmt in QtGui.QImageReader.supportedImageFormats()]
-        images = []
+        extensions = [
+            ".%s" % fmt.data().decode().lower()
+            for fmt in QtGui.QImageReader.supportedImageFormats()
+        ]
 
+        images = []
         for root, dirs, files in os.walk(folderPath):
             for file in files:
                 if file.lower().endswith(tuple(extensions)):
                     relativePath = osp.join(root, file)
                     images.append(relativePath)
-        images.sort(key=lambda x: x.lower())
+        images = natsort.os_sorted(images)
         return images
